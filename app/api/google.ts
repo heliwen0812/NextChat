@@ -107,7 +107,21 @@ async function request(req: NextRequest, apiKey: string) {
     body = null;
   }
 
-  // Add tools to the request body if it doesn't exist. This enables Google Search.
+  // Modify the prompt to use Chinese for responses *before* adding tools
+  if (body && body.contents && Array.isArray(body.contents)) {
+    body.contents.forEach((content: any) => {
+      if (content.parts && Array.isArray(content.parts)) {
+        content.parts.forEach((part: any) => {
+          if (typeof part.text === 'string') {
+            // Add instructions to use Chinese for responses
+            part.text = `${part.text}`;
+          }
+        });
+      }
+    });
+  }
+
+  // Add tools to the request body if it doesn't exist.  This enables Google Search.
   if (body && !body.tools) {
     body.tools = [{ googleSearch: {} }]
   }
@@ -116,7 +130,9 @@ async function request(req: NextRequest, apiKey: string) {
     headers: {
       "Content-Type": "application/json",
       "Cache-Control": "no-store",
-      "x-goog-api-key": apiKey,
+      "x-goog-api-key":
+        req.headers.get("x-goog-api-key") ||
+        (req.headers.get("Authorization") ?? "").replace("Bearer ", ""),
     },
     method: req.method,
     body: body ? JSON.stringify(body) : null,
@@ -127,95 +143,20 @@ async function request(req: NextRequest, apiKey: string) {
     signal: controller.signal,
   };
 
+
   try {
     const res = await fetch(fetchUrl, fetchOptions);
-    const contentType = res.headers.get("Content-Type") || "";
-    
-    // 处理流式响应（思考过程）
-    if (contentType.includes("text/event-stream")) {
-      const stream = new ReadableStream({
-        async start(controller) {
-          const reader = res.body!.getReader();
-          const decoder = new TextDecoder();
-          let functionCallBuffer = "";
-          
-          while (true) {
-            const { value, done } = await reader.read();
-            if (done) break;
-            
-            const chunk = decoder.decode(value, { stream: true });
-            const lines = chunk.split("\n");
-            
-            for (const line of lines) {
-              if (!line.startsWith("data: ")) continue;
-              
-              try {
-                const jsonStr = line.replace("data: ", "");
-                const eventData = JSON.parse(jsonStr);
-                
-                // 提取functionCall中间步骤
-                if (eventData.candidates?.[0]?.content?.parts?.[0]?.functionCall) {
-                  const functionCall = eventData.candidates[0].content.parts[0].functionCall;
-                  const thoughtData = {
-                    type: "functionCall",
-                    name: functionCall.name,
-                    args: functionCall.args
-                  };
-                  
-                  // 将思考步骤转换为前端可识别的格式
-                  const formattedData = `data: ${JSON.stringify(thoughtData)}\n\n`;
-                  controller.enqueue(new TextEncoder().encode(formattedData));
-                }
-                // 提取文本响应
-                else if (eventData.candidates?.[0]?.content?.parts?.[0]?.text) {
-                  const textContent = {
-                    type: "text",
-                    text: eventData.candidates[0].content.parts[0].text
-                  };
-                  
-                  const formattedData = `data: ${JSON.stringify(textContent)}\n\n`;
-                  controller.enqueue(new TextEncoder().encode(formattedData));
-                }
-              } catch (e) {
-                console.error("Error parsing event data:", e);
-              }
-            }
-          }
-          controller.close();
-        }
-      });
-      
-      return new Response(stream, {
-        headers: {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-          "Connection": "keep-alive"
-        }
-      });
-    } 
-    // 处理普通JSON响应
-    else {
-      const json = await res.json();
-      
-      // 提取思考过程（functionCall）
-      if (json.candidates?.[0]?.content?.parts?.[0]?.functionCall) {
-        const functionCall = json.candidates[0].content.parts[0].functionCall;
-        json.thoughtProcess = {
-          type: "functionCall",
-          name: functionCall.name,
-          args: functionCall.args,
-          reasoning: "模型正在调用工具进行思考"
-        };
-      }
-      
-      return new Response(JSON.stringify(json), {
-        status: res.status,
-        headers: {
-          "Content-Type": "application/json",
-          "Cache-Control": "no-store"
-        }
-      });
-    }
+    // to prevent browser prompt for credentials
+    const newHeaders = new Headers(res.headers);
+    newHeaders.delete("www-authenticate");
+    // to disable nginx buffering
+    newHeaders.set("X-Accel-Buffering", "no");
+
+    return new Response(res.body, {
+      status: res.status,
+      statusText: res.statusText,
+      headers: newHeaders,
+    });
   } finally {
     clearTimeout(timeoutId);
   }
